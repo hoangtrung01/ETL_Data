@@ -1,0 +1,106 @@
+import pyspark
+from pyspark.sql import SparkSession
+import pandas as pd
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+import os
+from pyspark.sql.window import Window
+import pyspark.sql.functions as sf
+import datetime
+spark = SparkSession.builder.appName("ETl_Trung").getOrCreate()
+from typing_extensions import final
+
+def read_file(path, file, date):
+    try:
+        day1 = spark.read.json(path + file)
+        output = day1.select('_source.AppName', '_source.Contract', '_source.TotalDuration')
+        output = output.withColumn('AppName',
+                      when((col('AppName') == 'CHANNEL') | (col('AppName') == 'KPLUS') | (col('AppName') == 'FIMS'), 'TVDuration')
+                      .when((col('AppName') == 'RELAX'), 'RelaxDuration')
+                      .when((col('AppName') == 'CHILD'), 'ChildDuration')
+                      .when((col('AppName') == 'SPORT'), 'SportDuration')
+                      .when((col('AppName') == 'VOD'), 'MovieDuration')
+                      .otherwise('None'))
+        output = output.withColumn('date', lit(date))
+        return output
+    except Exception as e:
+        print(f"Error processing file {file}: {e}")
+        return None
+
+def pivot_data(combined_data):
+    if combined_data is None:
+        raise ValueError("Input data is None, cannot pivot")
+
+    result = combined_data.groupBy('AppName', 'Contract', 'date').sum('TotalDuration')
+    result = result.withColumnRenamed('sum(TotalDuration)', 'TotalDuration_sum')
+    pivoted_data = result.groupBy("Contract", "date") \
+        .pivot("AppName") \
+        .sum("TotalDuration_sum")
+    return pivoted_data
+
+def most_watched(combined_data):
+    if combined_data is None:
+        raise ValueError("Input data is None, cannot find most watched")
+
+    partiti = Window.partitionBy('Contract').orderBy(desc('TotalDuration'))
+    most_watcheds = combined_data.withColumn('rank', row_number().over(partiti))
+    most_watcheds = most_watcheds.filter(most_watcheds.rank == 1)
+    most_watcheds = most_watcheds.withColumnRenamed('TotalDuration', 'most_watch')
+    return most_watcheds
+
+def CustomerTaste(pivoted_data):
+    Customer_Taste = concat_ws('-',
+                                when(col('ChildDuration') > 0, 'Child'),
+                                when(col('MovieDuration') > 0, 'Movie'),
+                                when(col('TVDuration') > 0, 'TV'),
+                                when(col('SportDuration') > 0, 'Sport'))
+    Customer_Tasted = pivoted_data.withColumn("Customer_Taste", Customer_Taste)
+    Customer_Tasted = Customer_Tasted.withColumn("Customer_Taste",
+                                                 when(col("Customer_Taste") == 'Child-Movie-Relax-Sport-TV', 'all')
+                                                 .otherwise(col("Customer_Taste")))
+    return Customer_Tasted
+
+def activiti(pivoted_data):
+    activiti = pivoted_data.withColumn('total',
+                    col('ChildDuration') + col('MovieDuration') + col('RelaxDuration') + col('SportDuration') + col('TVDuration'))
+    result_activity = activiti.groupBy('Contract').agg(count(when(col('total') > 0, 1)).alias('day_activiti'))
+    result_activity = result_activity.withColumn('tile%', col('day_activiti') / 5)
+    return result_activity
+
+def main():
+    path = '/content/data/'
+    list_file = os.listdir(path)
+    start_date = datetime.date(2022, 4, 1)
+    end_date = datetime.date(2022, 4, 5)
+    filted_file = [f for f in list_file if start_date <= datetime.datetime.strptime(f[:8], '%Y%m%d').date() <= end_date]
+
+    combined_data = None
+    for file in filted_file:
+        date_str = file[:8]
+        date = datetime.datetime.strptime(date_str, '%Y%m%d').date()
+        file_data = read_file(path, file, date)
+        if file_data is None:
+            continue
+        if combined_data is None:
+            combined_data = file_data
+        else:
+            combined_data = combined_data.union(file_data)
+
+    if combined_data is None:
+        raise ValueError("No valid data files found")
+
+    pivoted_data = pivot_data(combined_data)
+    pivoted_data = pivoted_data.fillna(0)
+    most_watcheds = most_watched(combined_data)
+    Customer_Tasted = CustomerTaste(pivoted_data)
+    result_activity = activiti(pivoted_data)
+
+    tonghop = most_watcheds.join(Customer_Tasted, on='Contract', how='outer')
+    tonghop = tonghop.join(result_activity, on='Contract', how='outer')
+
+    final = tonghop.select('Contract', 'most_watch', 'Customer_Taste', 'day_activiti','tile%')
+    final.write.csv('/content/result_etl/result3', header=True)
+    print("Done")
+
+if __name__ == "__main__":
+    main()
